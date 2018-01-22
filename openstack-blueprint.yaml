@@ -1,0 +1,184 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: |
+  This blueprint deploys Splunk on OpenStack.
+  It uses the common types and templates for Splunk, and adds the OpenStack-specific
+  artifacts (inputs, types and templates).
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.2/types.yaml
+  - http://www.getcloudify.org/spec/openstack-plugin/2.5.0/plugin.yaml
+  - http://www.getcloudify.org/spec/diamond-plugin/1.3.6/plugin.yaml
+  - http://www.getcloudify.org/spec/utilities-plugin/1.4.2/plugin.yaml
+  - includes/commons.yaml
+
+inputs:
+  openstack_username:
+    description: Username to authenticate to OpenStack with.
+    type: string
+    default: { get_secret: openstack_username }
+
+  openstack_password:
+    description: Password to authenticate to OpenStack with.
+    type: string
+    default: { get_secret: openstack_password }
+
+  openstack_tenant_name:
+    description: OpenStack tenant to create resources in.
+    type: string
+    default: { get_secret: openstack_tenant_name }
+
+  openstack_auth_url:
+    description: Keystone authentication URL.
+    type: string
+    default: { get_secret: openstack_auth_url }
+
+  openstack_region:
+    description: OpenStack region to use.
+    type: string
+    default: { get_secret: openstack_region }
+
+  image:
+    description: Image to use when creating VMs (name or ID).
+    type: string
+
+  flavor:
+    description: VM flavor to use when creating VMs (name or ID).
+    type: string
+
+  network:
+    description: Network to connect VMs to (name or ID).
+    type: string
+
+  agent_user:
+    description: The Linux account that the Cloudify Agent should run with.
+    type: string
+    default: centos
+
+  agents_security_group:
+    description: Security group that allows agent VMs to connect to Cloudify Manager.
+    type: string
+    default: { get_secret: agents_security_group }
+
+  keypair_name:
+    description: Keypair to associate new VMs with.
+    type: string
+    default: { get_secret: keypair_name }
+
+dsl_definitions:
+  openstack_configuration: &openstack_configuration
+    username: { get_input: openstack_username }
+    password: { get_input: openstack_password }
+    tenant_name: { get_input: openstack_tenant_name }
+    auth_url: { get_input: openstack_auth_url }
+    region: { get_input: openstack_region }
+
+node_types:
+  vm_type:
+    derived_from: cloudify.openstack.nodes.Server
+    properties:
+      agent_config:
+        default:
+          install_method: init_script
+          user: { get_input: agent_user }
+      openstack_config:
+        default: *openstack_configuration
+      image:
+        default: { get_input: image }
+      flavor:
+        default: { get_input: flavor }
+      server:
+        default:
+          key_name: { get_input: keypair_name }
+    interfaces:
+      cloudify.interfaces.monitoring_agent:
+        install:
+          implementation: diamond.diamond_agent.tasks.install
+          inputs:
+            diamond_config:
+              default:
+                interval: 1
+        start: diamond.diamond_agent.tasks.start
+        stop: diamond.diamond_agent.tasks.stop
+        uninstall: diamond.diamond_agent.tasks.uninstall
+      cloudify.interfaces.monitoring:
+        start:
+          implementation: diamond.diamond_agent.tasks.add_collectors
+          inputs:
+            collectors_config:
+              default:
+                CPUCollector: {}
+                MemoryCollector: {}
+                LoadAverageCollector: {}
+                DiskUsageCollector:
+                  config:
+                    devices: x?vd[a-z]+[0-9]*$
+                NetworkCollector: {}
+                ProcessResourcesCollector:
+                  config:
+                    enabled: true
+                    unit: B
+                    measure_collector_time: true
+                    cpu_interval: 0.5
+                    process:
+                      node:
+                        name: node
+
+node_templates:
+  network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_configuration
+      use_external_resource: true
+      resource_id: { get_input: network }
+
+  agents_security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *openstack_configuration
+      use_external_resource: True
+      resource_id: { get_input: agents_security_group }
+
+  ssh_security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *openstack_configuration
+      description: SSH Security Group
+      rules:
+        - port: 22
+          remote_ip_prefix: 0.0.0.0/0
+
+  splunk_security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *openstack_configuration
+      description: Security group for Splunk node
+      rules:
+        - port: { get_input: splunk_web_port }
+          remote_ip_prefix: 0.0.0.0/0
+        - port: { get_input: splunk_management_port }
+          remote_ip_prefix: 0.0.0.0/0
+        - port: { get_input: splunk_receiver_port }
+          remote_ip_prefix: 0.0.0.0/0
+
+  splunk_vm:
+    type: vm_type
+    relationships:
+      - type: cloudify.relationships.connected_to
+        target: network
+      - type: cloudify.openstack.server_connected_to_security_group
+        target: ssh_security_group
+      - type: cloudify.openstack.server_connected_to_security_group
+        target: splunk_security_group
+      - type: cloudify.openstack.server_connected_to_security_group
+        target: agents_security_group
+
+  forwarder_vm:
+    type: vm_type
+    relationships:
+      - type: cloudify.relationships.connected_to
+        target: network
+      - type: cloudify.openstack.server_connected_to_security_group
+        target: ssh_security_group
+      - type: cloudify.openstack.server_connected_to_security_group
+        target: agents_security_group

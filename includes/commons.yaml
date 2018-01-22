@@ -1,0 +1,217 @@
+# Contains blueprint elements that are common to multiple
+# IaaS implementations.
+
+inputs:
+  splunk_installer_url:
+    description: URL of the Splunk installation archive (`tar.gz` format).
+    type: string
+    default: { get_secret: splunk_installer_url }
+
+  splunk_home:
+    description: Directory where Splunk should be installed.
+    type: string
+    default: /opt/splunk
+
+  splunk_user:
+    description: Linux user under which Splunk should be run.
+    type: string
+    default: splunk
+
+  splunk_admin_password:
+    description: Password to set for Splunk Admin user.
+    type: string
+    default: { get_secret: splunk_admin_password }
+
+  splunk_db_path:
+    description: Location of Splunk's database.
+    type: string
+    default: /opt/splunk/data
+
+  splunk_web_port:
+    description: Port to set for Splunk's web interface.
+    type: integer
+    default: 8000
+
+  splunk_receiver_port:
+    description: Port to set for Splunk's Receiver.
+    type: integer
+    default: 8002
+
+  splunk_management_port:
+    description: Port to set for Splunk Management interface.
+    type: integer
+    default: 8001
+
+  forwarder_installer_url:
+    description: URL of the Splunk Forwarder installation archive (`tar.gz` format).
+    type: string
+    default: { get_secret: forwarder_installer_url }
+
+  forwarder_admin_password:
+    description: Password to set for Splunk Forwarder Admin user.
+    type: string
+    default: { get_secret: forwarder_admin_password }
+
+  forwarder_home:
+    description: Directory where Splunk Forwarder should be installed.
+    type: string
+    default: /opt/splunkforwarder
+
+  forwarder_user:
+    description: Linux user under which Splunk Forwarder should run.
+    type: string
+    default: splunkfwd
+
+relationships:
+  forwarder_to_splunk:
+    derived_from: cloudify.relationships.connected_to
+    source_interfaces:
+      cloudify.interfaces.relationship_lifecycle:
+        establish: scripts/connect_to_splunk.sh
+
+node_types:
+  splunk_node_type:
+    derived_from: cloudify.nodes.Root
+    properties:
+      splunk_installer_url:
+        type: string
+        default: { get_input: splunk_installer_url }
+      splunk_admin_password:
+        type: string
+        default: { get_input: splunk_admin_password }
+      splunk_web_port:
+        type: integer
+        default: { get_input: splunk_web_port }
+      splunk_management_port:
+        type: integer
+        default: { get_input: splunk_management_port }
+      splunk_receiver_port:
+        type: integer
+        default: { get_input: splunk_receiver_port }
+      home:
+        type: string
+        default: { get_input: splunk_home }
+      user:
+        type: string
+        default: { get_input: splunk_user }
+      db_path:
+        type: string
+        default: { get_input: splunk_db_path }
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        configure:
+          implementation: scripts/install_splunk.sh
+
+  forwarder_node_type:
+    derived_from: cloudify.nodes.Root
+    properties:
+      forwarder_installer_url:
+        type: string
+        default: { get_input: forwarder_installer_url }
+      forwarder_admin_password:
+        type: string
+        default: { get_input: forwarder_admin_password }
+      home:
+        type: string
+        default: { get_input: forwarder_home }
+      user:
+        type: string
+        default: { get_input: forwarder_user }
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/install_forwarder.sh
+
+node_templates:
+  splunk_vm_configurator:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/setup_splunk_vm.sh
+          inputs:
+            splunk_home: { get_property: [splunk, home] }
+            splunk_user: { get_property: [splunk, user] }
+    relationships:
+      - target: splunk_vm
+        type: cloudify.relationships.contained_in
+
+  splunk:
+    type: splunk_node_type
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: splunk_vm
+      - type: cloudify.relationships.depends_on
+        target: splunk_vm_configurator
+
+  forwarder_vm_configurator:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/setup_forwarder_vm.sh
+          inputs:
+            forwarder_home: { get_property: [forwarder, home] }
+            forwarder_user: { get_property: [forwarder, user] }
+    relationships:
+      - target: forwarder_vm
+        type: cloudify.relationships.contained_in
+
+  forwarder:
+    type: forwarder_node_type
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: forwarder_vm
+      - type: cloudify.relationships.depends_on
+        target: forwarder_vm_configurator
+      - type: forwarder_to_splunk
+        target: splunk
+
+  forwarder_condition:
+    type: cloudify.nodes.AttributePoller
+    properties:
+      description: 'Authorize forwarder install'
+    relationships:
+      - target: splunk
+        type: cloudify.relationships.depends_on
+
+groups:
+  forwarder_heal_group:
+    # The assumption is that "forwarder_vm" is defined elsewhere,
+    # in an IaaS-specific file.
+    members: [forwarder_vm]
+    policies:
+      simple_autoheal_policy:
+        type: cloudify.policies.types.host_failure
+        properties:
+          service:
+            - .*forwarder_vm.*.cpu.total.system
+          interval_between_workflows: 60
+        triggers:
+          auto_heal_trigger:
+            type: cloudify.policies.triggers.execute_workflow
+            parameters:
+              workflow: heal
+              workflow_parameters:
+                node_instance_id: { 'get_property': [ SELF, node_id ] }
+                diagnose_value: { 'get_property': [ SELF, diagnose ] }
+
+  splunk_heal_group:
+    # The assumption is that "splunk_vm" is defined elsewhere,
+    # in an IaaS-specific file.
+    members: [splunk_vm]
+    policies:
+      simple_autoheal_policy:
+        type: cloudify.policies.types.host_failure
+        properties:
+          service:
+            - .*splunk_vm.*.cpu.total.system
+          interval_between_workflows: 60
+        triggers:
+          auto_heal_trigger:
+            type: cloudify.policies.triggers.execute_workflow
+            parameters:
+              workflow: heal
+              workflow_parameters:
+                node_instance_id: { 'get_property': [ SELF, node_id ] }
+                diagnose_value: { 'get_property': [ SELF, diagnose ] }

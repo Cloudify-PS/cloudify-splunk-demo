@@ -1,0 +1,248 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: |
+  This blueprint deploys Splunk on AWS.
+  It uses the common types and templates for Splunk, and adds the AWS-specific
+  artifacts (inputs, types and templates).
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.2/types.yaml
+  - http://www.getcloudify.org/spec/aws-plugin/1.5.1.2/plugin.yaml
+  - http://www.getcloudify.org/spec/diamond-plugin/1.3.6/plugin.yaml
+  - http://www.getcloudify.org/spec/utilities-plugin/1.4.2/plugin.yaml
+  - https://github.com/Cloudify-PS/cloudify-suspend-resume-plugin/releases/download/1.0/plugin.yaml
+  - includes/commons.yaml
+
+inputs:
+  ec2_region_name:
+    description: EC2 region to use.
+    type: string
+    default: { get_secret: ec2_region_name }
+
+  aws_access_key_id:
+    description: Access key ID to use for AWS communications.
+    type: string
+    default: { get_secret: aws_access_key_id }
+
+  aws_secret_access_key:
+    description: Secret access key to use for AWS communications.
+    type: string
+    default: { get_secret: aws_secret_access_key }
+
+  vpc_id:
+    description: Existing VPC to use.
+    type: string
+    default: { get_secret: vpc_id }
+
+  private_subnet_id:
+    description: Subnet to connect new VMs to.
+    type: string
+    default: { get_secret: private_subnet_id }
+
+  ami_id:
+    description: AMI to use when creating VMs.
+    type: string
+    default: { get_secret: ami_id }
+
+  instance_type:
+    description: AWS instance type to create.
+    type: string
+    default: t2.medium
+
+  keypair_name:
+    description: Keypair to associate new VMs with.
+    type: string
+    default: { get_secret: keypair_name }
+
+  agent_user:
+    description: The Linux account that the Cloudify Agent should run with.
+    type: string
+    default: centos
+
+  agents_security_group:
+    description: Security group that allows agent VMs to connect to Cloudify Manager.
+    type: string
+    default: { get_secret: agents_security_group }
+
+  root_volume_size:
+    description: Size of VMs' root volume (GiB).
+    type: integer
+    default: 8
+
+dsl_definitions:
+  aws_config: &aws_config
+    aws_access_key_id: { get_input: aws_access_key_id }
+    aws_secret_access_key: { get_input: aws_secret_access_key }
+    ec2_region_name: { get_input: ec2_region_name }
+
+node_types:
+  vm_type:
+    derived_from: cloudify.aws.nodes.Instance
+    properties:
+      agent_config:
+        default:
+          install_method: init_script
+          user: { get_input: agent_user }
+      aws_config:
+        default: *aws_config
+      image_id:
+        default: { get_input: ami_id }
+      instance_type:
+        default: { get_input: instance_type }
+      parameters:
+        default:
+          key_name: { get_input: keypair_name }
+          block_device_map:
+            /dev/sda1:
+              size: { get_input: root_volume_size }
+              delete_on_termination: true
+    interfaces:
+      cloudify.interfaces.monitoring_agent:
+        install:
+          implementation: diamond.diamond_agent.tasks.install
+          inputs:
+            diamond_config:
+              default:
+                interval: 1
+        start: diamond.diamond_agent.tasks.start
+        stop: diamond.diamond_agent.tasks.stop
+        uninstall: diamond.diamond_agent.tasks.uninstall
+      cloudify.interfaces.monitoring:
+        start:
+          implementation: diamond.diamond_agent.tasks.add_collectors
+          inputs:
+            collectors_config:
+              default:
+                CPUCollector: {}
+                MemoryCollector: {}
+                LoadAverageCollector: {}
+                DiskUsageCollector:
+                  config:
+                    devices: x?vd[a-z]+[0-9]*$
+                NetworkCollector: {}
+                ProcessResourcesCollector:
+                  config:
+                    enabled: true
+                    unit: B
+                    measure_collector_time: true
+                    cpu_interval: 0.5
+                    process:
+                      node:
+                        name: node
+
+node_templates:
+  vpc:
+    type: cloudify.aws.nodes.VPC
+    properties:
+      aws_config: *aws_config
+      use_external_resource: true
+      resource_id: { get_input: vpc_id }
+      cidr_block: N/A
+
+  subnet:
+    type: cloudify.aws.nodes.Subnet
+    properties:
+      aws_config: *aws_config
+      use_external_resource: true
+      resource_id: { get_input: private_subnet_id }
+      cidr_block:  N/A
+      availability_zone:  N/A
+    relationships:
+      - type: cloudify.aws.relationships.subnet_contained_in_vpc
+        target: vpc
+
+  splunk_public_ip:
+    type: cloudify.aws.nodes.ElasticIP
+    properties:
+      aws_config: *aws_config
+      domain: vpc
+
+  forwarder_public_ip:
+    type: cloudify.aws.nodes.ElasticIP
+    properties:
+      aws_config: *aws_config
+      domain: vpc
+
+  agents_security_group:
+    type: cloudify.aws.nodes.SecurityGroup
+    properties:
+      aws_config: *aws_config
+      use_external_resource: True
+      description: N/A
+      resource_id: { get_input: agents_security_group }
+
+  ssh_security_group:
+    type: cloudify.aws.nodes.SecurityGroup
+    properties:
+      aws_config: *aws_config
+      description: SSH Security Group
+      rules:
+        - ip_protocol: tcp
+          from_port: 22
+          to_port: 22
+          cidr_ip: 0.0.0.0/0
+    relationships:
+      - type: cloudify.aws.relationships.security_group_contained_in_vpc
+        target: vpc
+
+  splunk_security_group:
+    type: cloudify.aws.nodes.SecurityGroup
+    properties:
+      aws_config: *aws_config
+      description: Security group for Splunk node
+      rules:
+        - ip_protocol: tcp
+          from_port: { get_input: splunk_web_port }
+          to_port: { get_input: splunk_web_port }
+          cidr_ip: 0.0.0.0/0
+        - ip_protocol: tcp
+          from_port: { get_input: splunk_management_port }
+          to_port: { get_input: splunk_management_port }
+          cidr_ip: 0.0.0.0/0
+        - ip_protocol: tcp
+          from_port: { get_input: splunk_receiver_port }
+          to_port: { get_input: splunk_receiver_port }
+          cidr_ip: 0.0.0.0/0
+    relationships:
+      - type: cloudify.aws.relationships.security_group_contained_in_vpc
+        target: vpc
+
+  splunk_vm:
+    type: vm_type
+    properties:
+      name: splunk-host
+    relationships:
+      - type: cloudify.aws.relationships.instance_connected_to_subnet
+        target: subnet
+      - type: cloudify.aws.relationships.instance_connected_to_security_group
+        target: ssh_security_group
+      - type: cloudify.aws.relationships.instance_connected_to_security_group
+        target: splunk_security_group
+      - type: cloudify.aws.relationships.instance_connected_to_security_group
+        target: agents_security_group
+      - type: cloudify.aws.relationships.instance_connected_to_elastic_ip
+        target: splunk_public_ip
+
+  forwarder_vm:
+    type: vm_type
+    properties:
+      name: forwarder-host
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: forwarder_condition
+      - type: cloudify.aws.relationships.instance_connected_to_subnet
+        target: subnet
+      - type: cloudify.aws.relationships.instance_connected_to_security_group
+        target: ssh_security_group
+      - type: cloudify.aws.relationships.instance_connected_to_security_group
+        target: agents_security_group
+      - type: cloudify.aws.relationships.instance_connected_to_elastic_ip
+        target: forwarder_public_ip
+
+outputs:
+  splunk_public_ip_address:
+    value: { get_attribute: [ splunk_public_ip, aws_resource_id ] }
+  forwarder_node_public_ip_address:
+    value: { get_attribute: [ forwarder_public_ip, aws_resource_id ] }
+  splunk_url_public:
+    value: { concat: ['http://', { get_attribute: [ splunk_public_ip, aws_resource_id ] }, ':', { get_input: splunk_web_port }] }
